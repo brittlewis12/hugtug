@@ -1,8 +1,16 @@
 [package]
 name = "hugtug"
-version = "0.1.0"
+version = "0.0.1-alpha"
 edition = "2021"
+description = "Tug HuggingFace models"
+authors = ["Britt Lewis <brittlewis12@gmail.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.75"
+clap = { version = "4.4.0", features = ["derive"] }
+indicatif = "0.17.6"
+reqwest = { version = "0.11.18", features = ["json", "blocking"] }
+serde = { version = "1.0.183", features = ["derive", "serde_derive"] }
+url = "2.4.0"
