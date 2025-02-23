@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use reqwest::{blocking::Client, header::CONTENT_LENGTH, Method};
+use reqwest::{Method, blocking::Client, header::CONTENT_LENGTH};
 use serde::Deserialize;
 use std::{fmt, fs::File, io::BufWriter, str::FromStr};
 use url::Url;
