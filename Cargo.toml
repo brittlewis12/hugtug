@@ -11,6 +11,6 @@ authors = ["Britt Lewis <brittlewis12@gmail.com>"]
 anyhow = "1.0.75"
 clap = { version = "4.4.0", features = ["derive"] }
 indicatif = "0.17.6"
-reqwest = { version = "0.11.18", features = ["json", "blocking"] }
+reqwest = { version = "0.12.12", features = ["json", "blocking"] }
 serde = { version = "1.0.183", features = ["derive", "serde_derive"] }
 url = "2.4.0"
