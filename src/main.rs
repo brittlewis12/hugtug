@@ -1,9 +1,15 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use reqwest::{Method, blocking::Client, header::CONTENT_LENGTH};
+use reqwest::{blocking::Client, header::CONTENT_LENGTH, Method};
 use serde::Deserialize;
-use std::{fmt, fs::File, io::BufWriter, str::FromStr};
+use std::{
+    fmt,
+    fs::{self, File},
+    io::BufWriter,
+    path::Path,
+    str::FromStr,
+};
 use url::Url;
 
 #[derive(Parser)]
@@ -65,7 +71,11 @@ impl Fetcher for HfFetcher {
 
     fn download_model(repo_id: &RepoId, model: &str) -> Result<()> {
         let resolve_url = format!("https://huggingface.co/{repo_id}/resolve/main/{model}");
-        let file = File::create(model)?;
+        let local_path = Path::new(model);
+        if let Some(parent) = local_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(local_path)?;
         let mut writer = BufWriter::new(file);
 
         let c = Client::new();
