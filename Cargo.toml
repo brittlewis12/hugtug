@@ -11,9 +11,10 @@ authors = ["Britt Lewis <brittlewis12@gmail.com>"]
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive"] }
 indicatif = "0.18"
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "blocking", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "blocking", "http2", "query"] }
 serde = { version = "1.0.228", features = ["derive", "serde_derive"] }
 url = "2.5.8"
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"
