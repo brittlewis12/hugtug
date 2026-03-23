@@ -8,9 +8,12 @@ authors = ["Britt Lewis <brittlewis12@gmail.com>"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.75"
-clap = { version = "4.4.0", features = ["derive"] }
-indicatif = "0.17.6"
-reqwest = { version = "0.12.12", features = ["json", "blocking"] }
-serde = { version = "1.0.183", features = ["derive", "serde_derive"] }
-url = "2.4.0"
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive"] }
+indicatif = "0.18"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "blocking", "http2"] }
+serde = { version = "1.0.228", features = ["derive", "serde_derive"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3"

@@ -70,11 +70,8 @@ impl Fetcher for HfFetcher {
     }
 
     fn download_model(repo_id: &RepoId, model: &str) -> Result<()> {
-        let resolve_url = format!("https://huggingface.co/{repo_id}/resolve/main/{model}");
-        let local_path = Path::new(model);
-        if let Some(parent) = local_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
+        let resolve_url = resolve_url(repo_id, model);
+        let local_path = prepare_local_path(Path::new("."), model)?;
         let file = File::create(local_path)?;
         let mut writer = BufWriter::new(file);
 
@@ -152,6 +149,20 @@ pub struct HfModelsJson {
     siblings: Vec<HfFile>,
 }
 
+/// Build the HuggingFace resolve URL for a model file.
+fn resolve_url(repo_id: &RepoId, model: &str) -> String {
+    format!("https://huggingface.co/{repo_id}/resolve/main/{model}")
+}
+
+/// Prepare the local file path for download, creating parent directories as needed.
+fn prepare_local_path(base: &Path, model: &str) -> Result<std::path::PathBuf> {
+    let local_path = base.join(model);
+    if let Some(parent) = local_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(local_path)
+}
+
 pub fn fetch_manifest_url(hf_repo_url: &str) -> Result<HfLfsManifest> {
     let repo = repo_id_from_url(hf_repo_url)?;
     dbg!(&repo);
@@ -176,50 +187,127 @@ pub fn repo_id_from_url(url: &str) -> Result<RepoId> {
 mod tests {
     use super::*;
 
+    // --- RepoId parsing ---
+
     #[test]
-    fn test_download_model() {
-        let model_filename = "llongorca-7b-16k.ggmlv3.q5_K_M.bin";
-        let result = HfFetcher::download_model(
-            &"TheBloke/LlongOrca-7B-16K-GGML".parse().unwrap(),
-            model_filename,
+    fn test_repo_id_parse_valid() {
+        let repo = RepoId::parse("org/repo").unwrap();
+        assert_eq!(repo.as_str(), "org/repo");
+    }
+
+    #[test]
+    fn test_repo_id_parse_missing_slash() {
+        let err = RepoId::parse("noslash").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "RepoId expects 'org/repo' format, got: 'noslash'"
         );
-        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_fetch_manifest() {
-        // start mock server
-        // set up test url constructed for mock server
-        // call manifest fn with test url
-        let result = HfFetcher::fetch_manifest(&"TheBloke/LlongOrca-7B-16K-GGML".parse().unwrap());
-        let files = result.unwrap().files;
-        assert_eq!(files, Vec::<String>::new());
-    }
-
-    #[test]
-    fn test_fetch_manifest_url() {
-        // start mock server
-        // set up test url constructed for mock server
-        // call manifest fn with test url
-        let result = fetch_manifest_url("https://huggingface.co/TheBloke/LlongOrca-7B-16K-GGML");
-        let files = result.unwrap().files;
-        assert_eq!(files, Vec::<String>::new());
+    fn test_repo_id_parse_uses_first_slash_only() {
+        let repo = RepoId::parse("org/repo/extra").unwrap();
+        assert_eq!(repo.as_str(), "org/repo/extra");
     }
 
     #[test]
     fn test_repo_id_from_url_with_extra_path_segments() {
         let result = repo_id_from_url("https://huggingface.co/org/repo/tree/main");
-        assert!(result.is_ok());
         assert_eq!(result.unwrap(), "org/repo".parse().unwrap());
     }
 
     #[test]
     fn test_repo_id_from_url_without_enough_path_segments() {
-        let result = repo_id_from_url("https://huggingface.co");
-        assert!(result.is_err());
+        let err = repo_id_from_url("https://huggingface.co").unwrap_err();
+        assert_eq!(err.to_string(), "Insufficient path segments");
+    }
+
+    // --- resolve URL construction ---
+
+    #[test]
+    fn test_resolve_url_flat_filename() {
+        let repo: RepoId = "org/repo".parse().unwrap();
         assert_eq!(
-            result.unwrap_err().to_string(),
-            "Insufficient path segments"
+            resolve_url(&repo, "model.gguf"),
+            "https://huggingface.co/org/repo/resolve/main/model.gguf"
         );
     }
+
+    #[test]
+    fn test_resolve_url_subdirectory_path() {
+        let repo: RepoId = "org/repo".parse().unwrap();
+        assert_eq!(
+            resolve_url(&repo, "subdir/model.safetensors"),
+            "https://huggingface.co/org/repo/resolve/main/subdir/model.safetensors"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_deeply_nested_path() {
+        let repo: RepoId = "org/repo".parse().unwrap();
+        assert_eq!(
+            resolve_url(&repo, "a/b/c/model.bin"),
+            "https://huggingface.co/org/repo/resolve/main/a/b/c/model.bin"
+        );
+    }
+
+    // --- local path preparation ---
+
+    #[test]
+    fn test_prepare_local_path_flat_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = prepare_local_path(tmp.path(), "model.gguf").unwrap();
+        assert_eq!(path, tmp.path().join("model.gguf"));
+        // no subdirectory should be created
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_prepare_local_path_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = prepare_local_path(tmp.path(), "subdir/model.safetensors").unwrap();
+        assert_eq!(path, tmp.path().join("subdir/model.safetensors"));
+        assert!(tmp.path().join("subdir").is_dir());
+    }
+
+    #[test]
+    fn test_prepare_local_path_creates_deeply_nested_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = prepare_local_path(tmp.path(), "a/b/c/model.bin").unwrap();
+        assert_eq!(path, tmp.path().join("a/b/c/model.bin"));
+        assert!(tmp.path().join("a/b/c").is_dir());
+    }
+
+    #[test]
+    fn test_prepare_local_path_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path1 = prepare_local_path(tmp.path(), "subdir/model.bin").unwrap();
+        let path2 = prepare_local_path(tmp.path(), "subdir/model.bin").unwrap();
+        assert_eq!(path1, path2);
+    }
+
+    // --- smoke tests (hit live HuggingFace API, skip in CI) ---
+
+    #[test]
+    #[ignore = "hits live HuggingFace API"]
+    fn smoke_test_fetch_manifest() {
+        let result = HfFetcher::fetch_manifest(&"bert-base-uncased".parse().unwrap());
+        let files = result.unwrap().files;
+        assert!(!files.is_empty(), "expected manifest to contain files");
+    }
+
+    // TODO: mocked integration tests
+    //
+    // Use a lightweight HTTP server (e.g. wiremock, httpmock, or mockito) to:
+    //
+    // 1. Mock the HF models API (`/api/models/{repo}`) returning a canned
+    //    siblings JSON payload, and verify fetch_manifest deserializes it.
+    //
+    // 2. Mock the resolve endpoint (`/{repo}/resolve/main/{file}`) returning
+    //    a small payload with a Content-Length header, and verify download_model
+    //    writes the correct bytes to the expected local path — including
+    //    subdirectory paths.
+    //
+    // This would let us test the full download flow without network access
+    // or multi-GB files.
 }
