@@ -1,15 +1,23 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use reqwest::{blocking::Client, header::CONTENT_LENGTH, Method};
-use serde::Deserialize;
+use reqwest::{
+    Method, StatusCode,
+    blocking::{Client, Response},
+    header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderMap, RANGE},
+    redirect::Policy,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fmt,
-    fs::{self, File},
-    io::BufWriter,
-    path::Path,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 
@@ -55,6 +63,12 @@ enum Commands {
         repo: RepoId,
         /// filename for the desired model to download. exact matches only
         model: String,
+        /// directory where the repo-relative model path should be written
+        #[arg(short = 'd', long = "dir", alias = "output-dir", default_value = ".")]
+        dir: PathBuf,
+        /// replace an existing local file if it differs from the remote file
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -72,7 +86,12 @@ fn main() -> Result<()> {
             all,
         } => cmd_search(&query, limit, trending, files, all),
         Commands::List { repo, all } => cmd_list(&repo, all),
-        Commands::Tug { repo, model } => cmd_download(&repo, &model),
+        Commands::Tug {
+            repo,
+            model,
+            dir,
+            force,
+        } => cmd_download(&repo, &model, &dir, force),
     }
 }
 
@@ -109,11 +128,26 @@ fn cmd_search(query: &str, limit: u32, trending: bool, show_files: bool, all: bo
                 .map(|s| s.rfilename.as_str())
                 .filter(|f| all || is_visible(f)),
         );
+
+        let mut age_parts: Vec<String> = Vec::new();
+        if let Some(age) = result.created_at.as_deref().and_then(format_age) {
+            age_parts.push(format!("created {age}"));
+        }
+        if let Some(age) = result.last_modified.as_deref().and_then(format_age) {
+            age_parts.push(format!("updated {age}"));
+        }
+        let age_str = if age_parts.is_empty() {
+            String::new()
+        } else {
+            format!("  \u{b7}  {}", age_parts.join("  \u{b7}  "))
+        };
+
         println!("  {}) {}", i + 1, &result.id);
         println!(
-            "     {} {}",
+            "     {} {}{}",
             format_downloads(result.downloads),
-            ext_summary
+            ext_summary,
+            age_str,
         );
 
         if show_files {
@@ -158,37 +192,27 @@ fn cmd_list(repo: &RepoId, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_download(repo_id: &RepoId, model: &str) -> Result<()> {
-    let url = resolve_url(repo_id, model);
-    let local_path = prepare_local_path(Path::new("."), model)?;
-    let file = File::create(local_path)?;
-    let mut writer = BufWriter::new(file);
-
+fn cmd_download(repo_id: &RepoId, model: &str, output_dir: &Path, force: bool) -> Result<()> {
+    let remote_path = RemotePath::parse(model)?;
     let client = Client::new();
-    let head_response = client.request(Method::HEAD, &url).send()?;
-    let model_size = head_response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .ok_or(anyhow!(
-            "Failed to read content-length header for URL {}",
-            &url
-        ))?
-        .to_str()?
-        .parse::<u64>()?;
+    let remote = probe_remote(&client, repo_id, &remote_path)?;
+    let paths = download_paths(output_dir, &remote_path)?;
 
-    println!("Model download size: ~{}", HumanBytes(model_size));
+    ensure_download_dirs(&paths)?;
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&paths.lock_path)
+        .with_context(|| format!("Failed to open lock file {}", paths.lock_path.display()))?;
+    lock_file.lock_exclusive().with_context(|| {
+        format!(
+            "Failed to acquire download lock {}",
+            paths.lock_path.display()
+        )
+    })?;
 
-    let progress = ProgressBar::new(model_size);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
-            .progress_chars("#>-"),
-    );
-
-    let mut response = client.request(Method::GET, url).send()?;
-    std::io::copy(&mut response, &mut progress.wrap_write(&mut writer))?;
-
-    Ok(())
+    download_locked(&client, &paths, &remote, force)
 }
 
 /// Files that are git/repo plumbing and never useful to download.
@@ -217,6 +241,8 @@ fn search_models(client: &Client, query: &str, limit: u32, sort: &str) -> Result
             ("limit", &limit.to_string()),
             ("expand[]", "siblings"),
             ("expand[]", "downloads"),
+            ("expand[]", "lastModified"),
+            ("expand[]", "createdAt"),
         ])
         .send()?;
     let repos: Vec<HfSearchResult> = response.json()?;
@@ -298,20 +324,794 @@ fn format_ext_breakdown<'a>(filenames: impl Iterator<Item = &'a str>) -> String 
     parts.join("  ")
 }
 
+/// Convert a civil date to days since Unix epoch (1970-01-01).
+/// Algorithm from <http://howardhinnant.github.io/date_algorithms.html>.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719_468
+}
+
+/// Parse an ISO 8601 UTC timestamp ("2026-05-06T10:02:17.000Z") to Unix epoch seconds.
+fn parse_iso8601_epoch_secs(s: &str) -> Option<u64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u64 = s.get(11..13)?.parse().ok()?;
+    let min: u64 = s.get(14..16)?.parse().ok()?;
+    let sec: u64 = s.get(17..19)?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86_400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Format an ISO 8601 timestamp as a compact relative-time string (e.g. "18d ago", "3mo ago").
+fn format_age(iso: &str) -> Option<String> {
+    let then = parse_iso8601_epoch_secs(iso)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let delta = now.saturating_sub(then);
+    let s = match delta {
+        0..60 => "just now".to_string(),
+        60..3_600 => format!("{}m ago", delta / 60),
+        3_600..86_400 => format!("{}h ago", delta / 3_600),
+        86_400..2_592_000 => format!("{}d ago", delta / 86_400),
+        2_592_000..31_536_000 => format!("{}mo ago", delta / 2_592_000),
+        _ => format!("{}y ago", delta / 31_536_000),
+    };
+    Some(s)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
+const DEFAULT_REVISION: &str = "main";
+const RESUME_SCHEMA_VERSION: u8 = 1;
+
 /// Build the HuggingFace resolve URL for a model file.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_url(repo_id: &RepoId, model: &str) -> String {
-    format!("https://huggingface.co/{repo_id}/resolve/main/{model}")
+    let remote_path = RemotePath::parse(model).expect("invalid remote path");
+    resolve_url_for_revision(repo_id, DEFAULT_REVISION, &remote_path).expect("invalid resolve URL")
+}
+
+fn resolve_url_for_revision(
+    repo_id: &RepoId,
+    revision: &str,
+    remote_path: &RemotePath,
+) -> Result<String> {
+    let mut url = Url::parse("https://huggingface.co")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("Failed to build HuggingFace URL"))?;
+        for segment in repo_id.as_str().split('/') {
+            segments.push(segment);
+        }
+        segments.push("resolve");
+        segments.push(revision);
+        for segment in &remote_path.components {
+            segments.push(segment);
+        }
+    }
+    Ok(url.to_string())
 }
 
 /// Prepare the local file path for download, creating parent directories as needed.
-fn prepare_local_path(base: &Path, model: &str) -> Result<std::path::PathBuf> {
-    let local_path = base.join(model);
+#[cfg_attr(not(test), allow(dead_code))]
+fn prepare_local_path(base: &Path, model: &str) -> Result<PathBuf> {
+    let remote_path = RemotePath::parse(model)?;
+    let local_path = remote_path.join_under(base);
     if let Some(parent) = local_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     Ok(local_path)
+}
+
+fn probe_remote(
+    client: &Client,
+    repo_id: &RepoId,
+    remote_path: &RemotePath,
+) -> Result<RemoteIdentity> {
+    let url = resolve_url_for_revision(repo_id, DEFAULT_REVISION, remote_path)?;
+    let probe_client = Client::builder().redirect(Policy::none()).build()?;
+    let response = probe_client
+        .request(Method::HEAD, &url)
+        .header(ACCEPT_ENCODING, "identity")
+        .send()
+        .with_context(|| format!("Failed to probe remote URL {url}"))?;
+    let status = response.status();
+    if !(status.is_success() || status.is_redirection()) {
+        bail!("Remote probe failed with HTTP {status} for {url}");
+    }
+
+    let headers = response.headers().clone();
+    let fallback_headers = if header_value(&headers, "X-Repo-Commit").is_none()
+        || remote_size_from_headers(&headers, status).is_none()
+    {
+        Some(range_probe(client, &url)?)
+    } else {
+        None
+    };
+
+    let commit = header_value(&headers, "X-Repo-Commit")
+        .or_else(|| {
+            fallback_headers
+                .as_ref()
+                .and_then(|h| header_value(h, "X-Repo-Commit"))
+        })
+        .ok_or_else(|| anyhow!("Remote response did not include X-Repo-Commit for {url}"))?;
+    let expected_size = remote_size_from_headers(&headers, status)
+        .or_else(|| {
+            fallback_headers
+                .as_ref()
+                .and_then(|h| remote_size_from_headers(h, StatusCode::PARTIAL_CONTENT))
+        })
+        .ok_or_else(|| anyhow!("Remote response did not include a usable size for {url}"))?;
+    let commit_url = resolve_url_for_revision(repo_id, &commit, remote_path)?;
+
+    Ok(RemoteIdentity {
+        repo_id: repo_id.as_str().to_string(),
+        path: remote_path.as_str().to_string(),
+        revision: DEFAULT_REVISION.to_string(),
+        resolved_commit: commit,
+        url: commit_url,
+        expected_size,
+        etag: header_value(&headers, "ETag").or_else(|| {
+            fallback_headers
+                .as_ref()
+                .and_then(|h| header_value(h, "ETag"))
+        }),
+        linked_etag: header_value(&headers, "X-Linked-ETag").or_else(|| {
+            fallback_headers
+                .as_ref()
+                .and_then(|h| header_value(h, "X-Linked-ETag"))
+        }),
+        xet_hash: header_value(&headers, "X-Xet-Hash").or_else(|| {
+            fallback_headers
+                .as_ref()
+                .and_then(|h| header_value(h, "X-Xet-Hash"))
+        }),
+        accept_ranges: header_value(&headers, "Accept-Ranges")
+            .or_else(|| {
+                fallback_headers
+                    .as_ref()
+                    .and_then(|h| header_value(h, "Accept-Ranges"))
+            })
+            .is_some_and(|v| v.eq_ignore_ascii_case("bytes")),
+    })
+}
+
+fn range_probe(client: &Client, url: &str) -> Result<HeaderMap> {
+    let response = client
+        .request(Method::GET, url)
+        .header(RANGE, "bytes=0-0")
+        .header(ACCEPT_ENCODING, "identity")
+        .send()
+        .with_context(|| format!("Failed to range-probe remote URL {url}"))?;
+    let status = response.status();
+    if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
+        bail!("Remote range probe failed with HTTP {status} for {url}");
+    }
+    Ok(response.headers().clone())
+}
+
+fn download_paths(output_dir: &Path, remote_path: &RemotePath) -> Result<DownloadPaths> {
+    let final_path = remote_path.join_under(output_dir);
+    let final_name = final_path
+        .file_name()
+        .ok_or_else(|| anyhow!("Remote path did not include a file name"))?
+        .to_string_lossy()
+        .to_string();
+    let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+    let state_dir = parent.join(".hugtug");
+    Ok(DownloadPaths {
+        final_path,
+        part_path: state_dir.join(format!("{final_name}.part")),
+        metadata_path: state_dir.join(format!("{final_name}.json")),
+        metadata_tmp_path: state_dir.join(format!("{final_name}.json.tmp")),
+        failed_part_path: state_dir.join(format!("{final_name}.failed-sha256.part")),
+        failed_metadata_path: state_dir.join(format!("{final_name}.failed-sha256.json")),
+        failed_metadata_tmp_path: state_dir.join(format!("{final_name}.failed-sha256.json.tmp")),
+        lock_path: state_dir.join(format!("{final_name}.lock")),
+        state_dir,
+    })
+}
+
+fn ensure_download_dirs(paths: &DownloadPaths) -> Result<()> {
+    if let Some(parent) = paths
+        .final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    fs::create_dir_all(&paths.state_dir).with_context(|| {
+        format!(
+            "Failed to create hugtug state directory {}",
+            paths.state_dir.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn download_locked(
+    client: &Client,
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    force: bool,
+) -> Result<()> {
+    remove_file_if_exists(&paths.metadata_tmp_path)?;
+    let metadata = match read_resume_metadata(&paths.metadata_path) {
+        Ok(metadata) => metadata,
+        Err(_) => None,
+    };
+
+    if paths.final_path.exists() {
+        let stat = fs::metadata(&paths.final_path)
+            .with_context(|| format!("Failed to inspect {}", paths.final_path.display()))?;
+        if !stat.is_file() {
+            bail!("{} exists but is not a file", paths.final_path.display());
+        }
+    }
+
+    if paths.final_path.exists() && !force {
+        let final_match = final_matches_remote(paths, remote, metadata.as_ref())?;
+        if final_match.matches {
+            remove_file_if_exists(&paths.part_path)?;
+            write_completed_metadata(paths, remote, final_match.sha256, metadata.as_ref())?;
+            println!("Already downloaded: {}", paths.final_path.display());
+            return Ok(());
+        }
+        bail!(
+            "{} already exists but does not match the remote file; pass --force to replace it",
+            paths.final_path.display()
+        );
+    }
+
+    let resume_metadata = reconcile_partial_state(paths, remote, metadata)?;
+    let created_at = resume_metadata
+        .as_ref()
+        .map(|m| m.created_at)
+        .unwrap_or_else(now_secs);
+    write_resume_metadata_atomic(
+        paths,
+        &ResumeMetadata::new(remote.clone(), paths, created_at, None),
+    )?;
+
+    println!("Model download size: ~{}", HumanBytes(remote.expected_size));
+    let verified_hash = stream_fresh_or_resumed(client, paths, remote)?;
+    finalize_download(paths, remote, verified_hash)?;
+    println!("Downloaded: {}", paths.final_path.display());
+    Ok(())
+}
+
+fn reconcile_partial_state(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    metadata: Option<ResumeMetadata>,
+) -> Result<Option<ResumeMetadata>> {
+    let part_exists = paths.part_path.exists();
+    match (part_exists, metadata) {
+        (true, Some(metadata)) if metadata.matches_remote(remote) => Ok(Some(metadata)),
+        (true, Some(_)) => {
+            remove_file_if_exists(&paths.part_path)?;
+            remove_file_if_exists(&paths.metadata_path)?;
+            Ok(None)
+        }
+        (true, None) => {
+            remove_file_if_exists(&paths.part_path)?;
+            Ok(None)
+        }
+        (false, Some(_)) => {
+            remove_file_if_exists(&paths.metadata_path)?;
+            Ok(None)
+        }
+        (false, None) => Ok(None),
+    }
+}
+
+fn stream_fresh_or_resumed(
+    client: &Client,
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+) -> Result<Option<String>> {
+    let progress = download_progress(remote.expected_size, 0)?;
+    let mut verified_hash = None;
+
+    loop {
+        let mut offset = file_len_if_exists(&paths.part_path)?;
+        if offset > remote.expected_size {
+            remove_file_if_exists(&paths.part_path)?;
+            offset = 0;
+        }
+        progress.set_position(offset);
+
+        if offset == remote.expected_size {
+            progress.finish_and_clear();
+            return Ok(verified_hash);
+        }
+        if offset > 0 {
+            println!("Resuming at {}", HumanBytes(offset));
+        }
+
+        let mut request = client
+            .request(Method::GET, &remote.url)
+            .header(ACCEPT_ENCODING, "identity");
+        if offset > 0 {
+            request = request.header(RANGE, format!("bytes={offset}-"));
+        }
+
+        let mut response = request
+            .send()
+            .with_context(|| format!("Failed to download {}", remote.url))?;
+        let status = response.status();
+
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            if offset == remote.expected_size {
+                progress.finish_and_clear();
+                return Ok(verified_hash);
+            }
+            remove_file_if_exists(&paths.part_path)?;
+            progress.set_position(0);
+            continue;
+        }
+
+        if status == StatusCode::OK && offset > 0 {
+            remove_file_if_exists(&paths.part_path)?;
+            progress.set_position(0);
+            continue;
+        }
+
+        if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+            bail!("Download failed with HTTP {status} for {}", remote.url);
+        }
+
+        if status == StatusCode::PARTIAL_CONTENT {
+            validate_content_range(response.headers(), offset, remote.expected_size)?;
+        }
+        if offset > 0 || status == StatusCode::PARTIAL_CONTENT {
+            validate_identity_encoding(&response)?;
+        }
+
+        let expected_hash = if offset == 0 {
+            remote.strong_sha256()
+        } else {
+            None
+        };
+        let mut hasher = expected_hash.as_ref().map(|_| Sha256::new());
+        let mut file = if offset == 0 {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&paths.part_path)
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&paths.part_path)
+        }
+        .with_context(|| format!("Failed to open partial file {}", paths.part_path.display()))?;
+
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = response.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])?;
+            if let Some(hasher) = &mut hasher {
+                hasher.update(&buffer[..read]);
+            }
+            progress.inc(read as u64);
+        }
+        file.flush()?;
+        drop(file);
+
+        let actual_size = file_len_if_exists(&paths.part_path)?;
+        if actual_size != remote.expected_size {
+            bail!(
+                "Download ended at {} but expected {}; run tug again to resume",
+                HumanBytes(actual_size),
+                HumanBytes(remote.expected_size)
+            );
+        }
+
+        if let (Some(expected_hash), Some(hasher)) = (expected_hash, hasher) {
+            let actual_hash = hex_lower(&hasher.finalize());
+            if actual_hash != expected_hash {
+                fail_hash_mismatch(paths, remote, &expected_hash, &actual_hash)?;
+            }
+            verified_hash = Some(actual_hash);
+        }
+    }
+}
+
+fn finalize_download(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    verified_hash: Option<String>,
+) -> Result<()> {
+    let actual_size = file_len_if_exists(&paths.part_path)?;
+    if actual_size != remote.expected_size {
+        bail!(
+            "Refusing to finalize {}; expected {} but found {}",
+            paths.part_path.display(),
+            HumanBytes(remote.expected_size),
+            HumanBytes(actual_size)
+        );
+    }
+
+    let part_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.part_path)
+        .with_context(|| format!("Failed to open partial file {}", paths.part_path.display()))?;
+    part_file
+        .sync_all()
+        .with_context(|| format!("Failed to sync partial file {}", paths.part_path.display()))?;
+    drop(part_file);
+
+    let verified_hash = verify_completed_part_hash(paths, remote, verified_hash)?;
+
+    #[cfg(windows)]
+    if paths.final_path.exists() {
+        fs::remove_file(&paths.final_path)?;
+    }
+
+    fs::rename(&paths.part_path, &paths.final_path).with_context(|| {
+        format!(
+            "Failed to finalize download from {} to {}",
+            paths.part_path.display(),
+            paths.final_path.display()
+        )
+    })?;
+    let existing = read_resume_metadata(&paths.metadata_path).ok().flatten();
+    write_completed_metadata(paths, remote, verified_hash, existing.as_ref())?;
+    remove_file_if_exists(&paths.metadata_tmp_path)?;
+    Ok(())
+}
+
+fn final_matches_remote(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    metadata: Option<&ResumeMetadata>,
+) -> Result<ExistingFinalMatch> {
+    let stat = fs::metadata(&paths.final_path)
+        .with_context(|| format!("Failed to inspect {}", paths.final_path.display()))?;
+    if !stat.is_file() {
+        bail!("{} exists but is not a file", paths.final_path.display());
+    }
+    if stat.len() != remote.expected_size {
+        return Ok(ExistingFinalMatch::no());
+    }
+    let expected_hash = remote.strong_sha256();
+    if let Some(completed) = metadata
+        .filter(|m| m.matches_remote(remote))
+        .and_then(|m| m.completed.as_ref())
+    {
+        if completed.size == stat.len() && completed.modified_at == modified_secs(&paths.final_path)
+        {
+            if let Some(expected_hash) = &expected_hash {
+                if completed.sha256.as_deref() == Some(expected_hash.as_str()) {
+                    return Ok(ExistingFinalMatch::yes(Some(expected_hash.clone())));
+                }
+            } else {
+                return Ok(ExistingFinalMatch::yes(None));
+            }
+        }
+    }
+    if let Some(expected_hash) = expected_hash {
+        let actual_hash = sha256_file(&paths.final_path)?;
+        return Ok(if actual_hash == expected_hash {
+            ExistingFinalMatch::yes(Some(actual_hash))
+        } else {
+            ExistingFinalMatch::no()
+        });
+    }
+    Ok(ExistingFinalMatch::yes(None))
+}
+
+fn verify_completed_part_hash(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    verified_hash: Option<String>,
+) -> Result<Option<String>> {
+    if verified_hash.is_some() {
+        return Ok(verified_hash);
+    }
+    let Some(expected_hash) = remote.strong_sha256() else {
+        return Ok(None);
+    };
+
+    let actual_hash = sha256_file(&paths.part_path)?;
+    if actual_hash != expected_hash {
+        fail_hash_mismatch(paths, remote, &expected_hash, &actual_hash)?;
+    }
+    Ok(Some(actual_hash))
+}
+
+fn fail_hash_mismatch(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    expected_sha256: &str,
+    actual_sha256: &str,
+) -> Result<()> {
+    quarantine_hash_mismatch(paths, remote, expected_sha256, actual_sha256)?;
+    bail!(
+        "Downloaded bytes did not match the expected SHA-256; final file was not written. Kept the failed payload at {} and wrote details to {}. This file is not resumable and is safe to delete.",
+        paths.failed_part_path.display(),
+        paths.failed_metadata_path.display()
+    )
+}
+
+fn quarantine_hash_mismatch(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    expected_sha256: &str,
+    actual_sha256: &str,
+) -> Result<()> {
+    remove_file_if_exists(&paths.failed_metadata_tmp_path)?;
+    remove_file_if_exists(&paths.failed_metadata_path)?;
+    remove_file_if_exists(&paths.failed_part_path)?;
+
+    fs::rename(&paths.part_path, &paths.failed_part_path).with_context(|| {
+        format!(
+            "Failed to quarantine hash-mismatched payload from {} to {}",
+            paths.part_path.display(),
+            paths.failed_part_path.display()
+        )
+    })?;
+    remove_file_if_exists(&paths.metadata_path)?;
+    remove_file_if_exists(&paths.metadata_tmp_path)?;
+
+    let metadata = FailedHashMetadata {
+        schema_version: RESUME_SCHEMA_VERSION,
+        remote: remote.clone(),
+        local_path: paths.final_path.to_string_lossy().to_string(),
+        failed_payload_path: paths.failed_part_path.to_string_lossy().to_string(),
+        expected_sha256: expected_sha256.to_string(),
+        actual_sha256: actual_sha256.to_string(),
+        size: fs::metadata(&paths.failed_part_path)?.len(),
+        failed_at: now_secs(),
+        reason: "sha256-mismatch".to_string(),
+    };
+    write_failed_hash_metadata_atomic(paths, &metadata)
+}
+
+fn write_failed_hash_metadata_atomic(
+    paths: &DownloadPaths,
+    metadata: &FailedHashMetadata,
+) -> Result<()> {
+    fs::create_dir_all(&paths.state_dir)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.failed_metadata_tmp_path)
+        .with_context(|| {
+            format!(
+                "Failed to write temporary failure metadata {}",
+                paths.failed_metadata_tmp_path.display()
+            )
+        })?;
+    serde_json::to_writer_pretty(&mut file, metadata)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&paths.failed_metadata_tmp_path, &paths.failed_metadata_path).with_context(
+        || {
+            format!(
+                "Failed to install failure metadata {}",
+                paths.failed_metadata_path.display()
+            )
+        },
+    )?;
+    Ok(())
+}
+
+fn write_completed_metadata(
+    paths: &DownloadPaths,
+    remote: &RemoteIdentity,
+    sha256: Option<String>,
+    existing: Option<&ResumeMetadata>,
+) -> Result<()> {
+    let created_at = existing.map(|m| m.created_at).unwrap_or_else(now_secs);
+    let completed = CompletedMetadata {
+        size: fs::metadata(&paths.final_path)?.len(),
+        modified_at: modified_secs(&paths.final_path),
+        sha256,
+    };
+    write_resume_metadata_atomic(
+        paths,
+        &ResumeMetadata::new(remote.clone(), paths, created_at, Some(completed)),
+    )
+}
+
+fn read_resume_metadata(path: &Path) -> Result<Option<ResumeMetadata>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read metadata {}", path.display()))?;
+    Ok(Some(serde_json::from_str(&text).with_context(|| {
+        format!("Failed to parse metadata {}", path.display())
+    })?))
+}
+
+fn write_resume_metadata_atomic(paths: &DownloadPaths, metadata: &ResumeMetadata) -> Result<()> {
+    fs::create_dir_all(&paths.state_dir)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.metadata_tmp_path)
+        .with_context(|| {
+            format!(
+                "Failed to write temporary metadata {}",
+                paths.metadata_tmp_path.display()
+            )
+        })?;
+    serde_json::to_writer_pretty(&mut file, metadata)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&paths.metadata_tmp_path, &paths.metadata_path).with_context(|| {
+        format!(
+            "Failed to install metadata {}",
+            paths.metadata_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn download_progress(total: u64, initial: u64) -> Result<ProgressBar> {
+    let progress = ProgressBar::new(total);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+            .progress_chars("#>-"),
+    );
+    progress.set_position(initial);
+    Ok(progress)
+}
+
+fn remote_size_from_headers(headers: &HeaderMap, status: StatusCode) -> Option<u64> {
+    header_u64(headers, "X-Linked-Size")
+        .or_else(|| content_range_total(headers))
+        .or_else(|| {
+            status
+                .is_success()
+                .then(|| header_u64(headers, "Content-Length"))
+                .flatten()
+        })
+}
+
+fn validate_content_range(
+    headers: &HeaderMap,
+    expected_start: u64,
+    expected_total: u64,
+) -> Result<()> {
+    let content_range = header_value(headers, "Content-Range")
+        .ok_or_else(|| anyhow!("Ranged response did not include Content-Range"))?;
+    let (start, total) = parse_content_range_start_total(&content_range)
+        .ok_or_else(|| anyhow!("Invalid Content-Range header: {content_range}"))?;
+    if start != expected_start || total != expected_total {
+        bail!(
+            "Unexpected Content-Range {content_range}; expected start {expected_start} and total {expected_total}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_identity_encoding(response: &Response) -> Result<()> {
+    if let Some(encoding) = response
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !encoding.eq_ignore_ascii_case("identity") {
+            bail!("Ranged response used unsupported Content-Encoding: {encoding}");
+        }
+    }
+    Ok(())
+}
+
+fn content_range_total(headers: &HeaderMap) -> Option<u64> {
+    header_value(headers, "Content-Range").and_then(|v| parse_content_range_total(&v))
+}
+
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    value.rsplit_once('/')?.1.parse().ok()
+}
+
+fn parse_content_range_start_total(value: &str) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, _) = range.split_once('-')?;
+    Some((start.parse().ok()?, total.parse().ok()?))
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    header_value(headers, name)?.parse().ok()
+}
+
+fn file_len_if_exists(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                bail!("{} exists but is not a file", path.display());
+            }
+            Ok(metadata.len())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn modified_secs(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 pub fn repo_id_from_url(url: &str) -> Result<RepoId> {
@@ -386,12 +1186,188 @@ pub struct HfSearchResult {
     downloads: u64,
     #[serde(default)]
     siblings: Vec<HfFile>,
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default, rename = "lastModified")]
+    last_modified: Option<String>,
 }
 
 /// Processed file info for display.
 pub struct FileInfo {
     path: String,
     size: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RemotePath {
+    original: String,
+    components: Vec<String>,
+}
+
+impl RemotePath {
+    fn parse(input: &str) -> Result<Self> {
+        if input.is_empty() {
+            bail!("Model path cannot be empty");
+        }
+        if input.starts_with('/') || input.starts_with('\\') || input.contains('\\') {
+            bail!("Model path must be a repo-relative path: {input}");
+        }
+
+        let components: Vec<String> = input
+            .split('/')
+            .map(|component| {
+                if component.is_empty() || component == "." || component == ".." {
+                    bail!("Model path contains an unsafe component: {input}");
+                }
+                Ok(component.to_string())
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            original: input.to_string(),
+            components,
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.original
+    }
+
+    fn join_under(&self, base: &Path) -> PathBuf {
+        self.components
+            .iter()
+            .fold(base.to_path_buf(), |path, component| path.join(component))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DownloadPaths {
+    final_path: PathBuf,
+    state_dir: PathBuf,
+    part_path: PathBuf,
+    metadata_path: PathBuf,
+    metadata_tmp_path: PathBuf,
+    failed_part_path: PathBuf,
+    failed_metadata_path: PathBuf,
+    failed_metadata_tmp_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RemoteIdentity {
+    repo_id: String,
+    path: String,
+    revision: String,
+    resolved_commit: String,
+    url: String,
+    expected_size: u64,
+    etag: Option<String>,
+    linked_etag: Option<String>,
+    xet_hash: Option<String>,
+    accept_ranges: bool,
+}
+
+impl RemoteIdentity {
+    fn same_file(&self, other: &RemoteIdentity) -> bool {
+        self.repo_id == other.repo_id
+            && self.path == other.path
+            && self.revision == other.revision
+            && self.resolved_commit == other.resolved_commit
+            && self.expected_size == other.expected_size
+            && self.etag == other.etag
+            && self.linked_etag == other.linked_etag
+            && self.xet_hash == other.xet_hash
+    }
+
+    fn strong_sha256(&self) -> Option<String> {
+        self.linked_etag
+            .as_deref()
+            .or(self.etag.as_deref())
+            .and_then(normalize_sha256)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ResumeMetadata {
+    schema_version: u8,
+    remote: RemoteIdentity,
+    local_path: String,
+    created_at: u64,
+    last_seen_at: u64,
+    completed: Option<CompletedMetadata>,
+}
+
+impl ResumeMetadata {
+    fn new(
+        remote: RemoteIdentity,
+        paths: &DownloadPaths,
+        created_at: u64,
+        completed: Option<CompletedMetadata>,
+    ) -> Self {
+        Self {
+            schema_version: RESUME_SCHEMA_VERSION,
+            remote,
+            local_path: paths.final_path.to_string_lossy().to_string(),
+            created_at,
+            last_seen_at: now_secs(),
+            completed,
+        }
+    }
+
+    fn matches_remote(&self, remote: &RemoteIdentity) -> bool {
+        self.schema_version == RESUME_SCHEMA_VERSION && self.remote.same_file(remote)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompletedMetadata {
+    size: u64,
+    modified_at: Option<u64>,
+    sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FailedHashMetadata {
+    schema_version: u8,
+    remote: RemoteIdentity,
+    local_path: String,
+    failed_payload_path: String,
+    expected_sha256: String,
+    actual_sha256: String,
+    size: u64,
+    failed_at: u64,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct ExistingFinalMatch {
+    matches: bool,
+    sha256: Option<String>,
+}
+
+impl ExistingFinalMatch {
+    fn yes(sha256: Option<String>) -> Self {
+        Self {
+            matches: true,
+            sha256,
+        }
+    }
+
+    fn no() -> Self {
+        Self {
+            matches: false,
+            sha256: None,
+        }
+    }
+}
+
+fn normalize_sha256(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_start_matches("W/").trim_matches('"');
+    if normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(normalized.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -537,6 +1513,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_url_encodes_path_segments() {
+        let repo: RepoId = "org/repo".parse().unwrap();
+        assert_eq!(
+            resolve_url(&repo, "nested/model name.gguf"),
+            "https://huggingface.co/org/repo/resolve/main/nested/model%20name.gguf"
+        );
+    }
+
+    #[test]
+    fn test_remote_path_rejects_traversal() {
+        assert!(RemotePath::parse("../model.gguf").is_err());
+        assert!(RemotePath::parse("a/../model.gguf").is_err());
+        assert!(RemotePath::parse("/model.gguf").is_err());
+        assert!(RemotePath::parse("a//model.gguf").is_err());
+        assert!(RemotePath::parse("a\\model.gguf").is_err());
+    }
+
+    #[test]
+    fn test_download_paths_for_nested_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_path = RemotePath::parse("Q2_K_L/foo.gguf").unwrap();
+        let paths = download_paths(tmp.path(), &remote_path).unwrap();
+        assert_eq!(paths.final_path, tmp.path().join("Q2_K_L/foo.gguf"));
+        assert_eq!(paths.state_dir, tmp.path().join("Q2_K_L/.hugtug"));
+        assert_eq!(
+            paths.part_path,
+            tmp.path().join("Q2_K_L/.hugtug/foo.gguf.part")
+        );
+        assert_eq!(
+            paths.metadata_path,
+            tmp.path().join("Q2_K_L/.hugtug/foo.gguf.json")
+        );
+        assert_eq!(
+            paths.failed_part_path,
+            tmp.path()
+                .join("Q2_K_L/.hugtug/foo.gguf.failed-sha256.part")
+        );
+        assert_eq!(
+            paths.failed_metadata_path,
+            tmp.path()
+                .join("Q2_K_L/.hugtug/foo.gguf.failed-sha256.json")
+        );
+        assert_eq!(
+            paths.lock_path,
+            tmp.path().join("Q2_K_L/.hugtug/foo.gguf.lock")
+        );
+    }
+
+    #[test]
+    fn test_hash_mismatch_quarantines_part_and_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_path = RemotePath::parse("Q2_K_L/foo.gguf").unwrap();
+        let paths = download_paths(tmp.path(), &remote_path).unwrap();
+        ensure_download_dirs(&paths).unwrap();
+        std::fs::write(&paths.part_path, b"bad").unwrap();
+        std::fs::write(&paths.metadata_path, b"{}").unwrap();
+
+        let remote = RemoteIdentity {
+            repo_id: "org/repo".to_string(),
+            path: remote_path.as_str().to_string(),
+            revision: DEFAULT_REVISION.to_string(),
+            resolved_commit: "0123456789012345678901234567890123456789".to_string(),
+            url: "https://huggingface.co/org/repo/resolve/0123456789012345678901234567890123456789/Q2_K_L/foo.gguf".to_string(),
+            expected_size: 3,
+            etag: None,
+            linked_etag: None,
+            xet_hash: None,
+            accept_ranges: true,
+        };
+
+        quarantine_hash_mismatch(&paths, &remote, "expected", "actual").unwrap();
+
+        assert!(!paths.part_path.exists());
+        assert!(!paths.metadata_path.exists());
+        assert_eq!(std::fs::read(&paths.failed_part_path).unwrap(), b"bad");
+
+        let text = std::fs::read_to_string(&paths.failed_metadata_path).unwrap();
+        let metadata: FailedHashMetadata = serde_json::from_str(&text).unwrap();
+        assert_eq!(metadata.reason, "sha256-mismatch");
+        assert_eq!(metadata.expected_sha256, "expected");
+        assert_eq!(metadata.actual_sha256, "actual");
+        assert_eq!(metadata.size, 3);
+        assert_eq!(metadata.remote.path, "Q2_K_L/foo.gguf");
+    }
+
     // --- local path preparation ---
 
     #[test]
@@ -569,6 +1631,15 @@ mod tests {
         let path1 = prepare_local_path(tmp.path(), "subdir/model.bin").unwrap();
         let path2 = prepare_local_path(tmp.path(), "subdir/model.bin").unwrap();
         assert_eq!(path1, path2);
+    }
+
+    #[test]
+    fn test_parse_content_range_start_and_total() {
+        assert_eq!(
+            parse_content_range_start_total("bytes 123-456/789"),
+            Some((123, 789))
+        );
+        assert_eq!(parse_content_range_start_total("invalid"), None);
     }
 
     // --- deserialization ---
